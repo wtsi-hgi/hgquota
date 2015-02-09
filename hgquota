@@ -1,7 +1,7 @@
 #!/usr/bin/env perl
 
 ################################################################################
-# Copyright (c) 2015 Genome Research Ltd. 
+# Copyright (c) 2013, 2015 Genome Research Ltd. 
 # 
 # Author: Joshua C. Randall <jcrandall@alum.mit.edu>
 # 
@@ -22,8 +22,15 @@
 use File::stat qw(stat);
 use Sys::Filesystem::MountPoint qw(path_to_mount_point);
 use Filesys::Df qw(df);
+use LWP::Simple qw(get);
+use HTML::TableExtract;
 
 my $LOP_CMD="/software/hgi/pkglocal/lustre_operator-git-602b61d/bin/lustre_operator /usr/bin/lfs";
+my $NFS_HG_URL="http://sandb.internal.sanger.ac.uk/humgen-quota.html";
+
+# decimal SI unit labels from bytes to yottabytes
+my $DECIMAL_UNIT_LABELS = ["B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB"];
+
 my $DEBUG=0;
 
 my $dir = shift || ".";
@@ -72,33 +79,104 @@ sub lustre_get_user_size_remaining {
     }
 }
 
+sub bytes_to_gib {
+    my $bytes = shift;
+    return $bytes / (1024 ** 3);
+}
+
 sub lustre_get_size_available {
     my $mount_point = shift;
-    my $df = df($mount_point) or die "could not df ${mount_point}\n";
+    my $df = df($mount_point, 1) or die "could not df ${mount_point}\n";
     my $bytes_avail = $df->{'bavail'} or die "could not get available bytes for ${mount_point}\n";
-    my $gib_avail = $bytes_avail / (1024 ** 3);
+    my $gib_avail = bytes_to_gib($bytes_avail);
     print "filesystem mounted at ${mount_point} has $gib_avail GiB available\n" if($DEBUG>0);
     return $gib_avail;
 }
 
-if ($mount_point =~ m/^\/lustre\/scratch[[:digit:]]+$/) {
-
-    print STDERR "$dir is owned by group $group and is on Lustre device mounted at $mount_point\n" if($DEBUG>0);
+sub lustre_get_available_quota {
+    my $mount_point = shift;
+    my $username = shift;
+    my $group = shift;
 
     my $group_remaining = lustre_get_group_size_remaining($mount_point, $group);
     my $user_remaining = lustre_get_user_size_remaining($mount_point, $username);
     my $disk_avail = lustre_get_size_available($mount_point);
-    my $effective_quota = $disk_avail; 
-    if (! $group_remaining =~ m/unlimited/) {
-	$effective_quota = $group_remaining;
+
+    my $available_quota = $disk_avail; 
+
+    if (! ($group_remaining =~ m/unlimited/)) {
+	$available_quota = $group_remaining;
     }
-    if (! $user_remaining =~ m/unlimited/) {
-	if ($user_remaining < $effective_quota) {
-	    $effective_quota = $user_remaining;
+    if (! ($user_remaining =~ m/unlimited/)) {
+	if ($user_remaining < $available_quota) {
+	    $available_quota = $user_remaining;
 	}
     }
     
-    print "available quota for ${username}:${group} on ${mount_point} is ${effective_quota} GiB\n";
-} else {
-    die "Mount point $mount_point does not look like a Lustre device.\n";
+    return $available_quota;
 }
+
+#################################################################################
+# size_formatted_to_bytes - convert from formatted size units to bytes
+#
+# Inputs
+#    1: formatted string with value and units (e.g. "1.5TiB")
+# Returns
+#    bytes
+#################################################################################
+sub size_formatted_to_bytes {
+    my $formatted = shift;
+    
+    $formatted =~ m/^([0-9]+([.][0-9]+)?)[[:space:]]*((B|KiB|MiB|GiB|TiB|PiB|EiB|ZiB|YiB|kB|MB|GB|TB|PB|EB|ZB|YB){0,1})$/ or error_exit("convert_to_bytes: malformatted string [$formatted]");
+    
+    my $value = $1;
+    my $units = $3 || "B";
+    
+    # fixed unit specification requiring conversion
+    for (my $i=0; $i<@{$DECIMAL_UNIT_LABELS}; $i++) {
+        if ($DECIMAL_UNIT_LABELS->[$i] eq $units) {
+            return sprintf("%d", ($value * 1024 * (1000 ** ($i-1))));
+        }
+    }
+    die "could not convert size $formatted to bytes\n";
+}
+
+sub humgen_nfs_get_remaining {
+    my $mount_point = shift;
+    my $group = shift;
+    
+    $content = get($NFS_HG_URL) or die "Couldn't retrieve NFS quota information from $NFS_HG_URL!\n";
+
+    my $mount_point_vol = $mount_point;
+    $mount_point_vol =~ s/\/nfs\///;
+    
+    my $te = HTML::TableExtract->new( headers => [qw(Volume ID Used Limit)] );
+    $te->parse($content);
+    foreach $row ($te->rows) {
+	my ($vol, $id, $used, $limit) = @$row;
+	if ($vol eq $mount_point_vol) {	
+	    if ($id eq $group) {
+		print STDERR "have used $used of limit $limit for group $group on ${mount_point}\n" if($DEBUG>0);
+		my $limit_bytes = size_formatted_to_bytes($limit);
+		my $used_bytes = size_formatted_to_bytes($used);
+		my $remaining_bytes = $limit_bytes - $used_bytes;
+		return bytes_to_gib($remaining_bytes);
+	    }
+	}
+    }
+}
+
+
+my $available_quota_gib = 0;
+if ($mount_point =~ m/^\/lustre\/scratch[[:digit:]]+$/) {
+    print STDERR "Have a Lustre filesystem mounted at $mount_point\n" if($DEBUG>0);
+    $available_quota_gib = lustre_get_available_quota($mount_point, $username, $group); 
+} elsif ($mount_point =~ m/^\/nfs\/humgen/) {
+    print STDERR "Have a humgen NFS filesystem mounted at $mount_point\n" if($DEBUG>0);
+    $available_quota_gib = humgen_nfs_get_remaining($mount_point, $group);
+} else {
+    die "Mount point $mount_point is not a supported device.\n";
+}
+
+print "available quota for ${username}:${group} on ${mount_point} is ${available_quota_gib} GiB\n";
+
