@@ -19,6 +19,7 @@
 # along with this program. If not, see <http://www.gnu.org/licenses/>. 
 ################################################################################
 
+use Getopt::Long qw(GetOptionsFromArray :config posix_default no_ignore_case bundling);
 use File::stat qw(stat);
 use Sys::Filesystem::MountPoint qw(path_to_mount_point);
 use Filesys::Df qw(df);
@@ -27,35 +28,36 @@ use HTML::TableExtract;
 
 my $LOP_CMD="/software/hgi/pkglocal/lustre_operator-git-602b61d/bin/lustre_operator /usr/bin/lfs";
 my $NFS_HG_URL="http://sandb.internal.sanger.ac.uk/humgen-quota.html";
-
-# decimal SI unit labels from bytes to yottabytes
-my $DECIMAL_UNIT_LABELS = ["B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB"];
-
 my $DEBUG=0;
 
-my $dir = shift || ".";
+# binary SI units labels from bytes to yobibytes
+my $BINARY_UNIT_LABELS  = ["B","KiB","MiB","GiB","TiB","PiB","EiB","ZiB","YiB"];
 
-my $st = stat($dir) or die "No such directory $dir: $!\n";
-my ($group, undef) = getgrgid($st->gid);
-print STDERR "Have group ${group}\n" if($DEBUG>0);
+# decimal SI unit labels from bytes to yottabytes
+my $DECIMAL_UNIT_LABELS = ["B", "kB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB"];
 
-my $username = getpwuid($<) or die "Could not ascertain username for uid $<!";
-print STDERR "Have username ${username}\n" if($DEBUG>0);
+# ratio of the next unit value at which to switch to it
+# (e.g. 0.8 implies we would say "0.8 kB" instead of "800 B"
+# whereas 1.2 would mean we would say "1199 B" but "1.2 kB" instead of "1200 B")
+my $HUMAN_TRIGGER_RATIO = 0.8;
 
-my $mount_point = path_to_mount_point($dir) or die "Could not determine mount point for $dir: $Sys::Filesystem::MountPoint::errstr\n";
-print STDERR "Have mount point ${mount_point}\n" if($DEBUG>0);
+# separator between value and units in output
+my $OUTPUT_UNIT_SEP = "";
+
+my $DECIMAL_UNIT_LABELS_DF = ["B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB"];
+my $DECIMAL_UNIT_LABELS_QUOTA = ["B", "K", "M", "G", "T", "P", "E", "Z", "Y"];
 
 sub lustre_get_group_size_remaining {
     my $mount_point = shift;
     my $group = shift;
     
-    my $lop_group_output = `${LOP_CMD} ${mount_point} getquota -g ${group} -s GiB -f dumper` or die "Error getting quota for group ${group} on ${mount_point} - are you in group ${group}?\n";
+    my $lop_group_output = `${LOP_CMD} ${mount_point} getquota -g ${group} -s B -f dumper` or die "Error getting quota for group ${group} on ${mount_point} - are you in group ${group}?\n";
     my $lop_group = eval ${lop_group_output};
     if ( exists($lop_group->{group}) &&
 	 exists($lop_group->{group}->{${group}}) ) {
 	my $size_remaining = $lop_group->{group}->{${group}}->{'size-remaining'};
-	$size_remaining =~ s/[[:space:]]*GiB$//;
-	print STDERR "${group} has ${size_remaining} GiB on ${mount_point}\n" if($DEBUG>0);
+	$size_remaining =~ s/[[:space:]]*B$//;
+	print STDERR "${group} has ${size_remaining} B on ${mount_point}\n" if($DEBUG>0);
 	return $size_remaining;
     } else {
 	die "Could not parse output from lustre_operator: $lop_group_output\n";
@@ -66,13 +68,13 @@ sub lustre_get_user_size_remaining {
     my $mount_point = shift;
     my $user = shift;
     
-    my $lop_user_output = `${LOP_CMD} ${mount_point} getquota -u ${user} -s GiB -f dumper` or die "Error getting quota for user ${user} on ${mount_point}\n";
+    my $lop_user_output = `${LOP_CMD} ${mount_point} getquota -u ${user} -s B -f dumper` or die "Error getting quota for user ${user} on ${mount_point}\n";
     my $lop_user = eval ${lop_user_output};
     if ( exists($lop_user->{user}) &&
 	 exists($lop_user->{user}->{${user}}) ) {
 	my $size_remaining = $lop_user->{user}->{${user}}->{'size-remaining'};
-	$size_remaining =~ s/[[:space:]]*GiB$//;
-	print STDERR "${user} has ${size_remaining} GiB on ${mount_point}\n" if($DEBUG>0);
+	$size_remaining =~ s/[[:space:]]*B$//;
+	print STDERR "${user} has ${size_remaining} B on ${mount_point}\n" if($DEBUG>0);
 	return $size_remaining;
     } else {
 	die "Could not parse output from lustre_operator: $lop_user_output\n";
@@ -81,16 +83,15 @@ sub lustre_get_user_size_remaining {
 
 sub bytes_to_gib {
     my $bytes = shift;
-    return $bytes / (1024 ** 3);
+    return ($bytes / (1024 ** 3));
 }
 
-sub lustre_get_size_available {
+sub df_get_size_available {
     my $mount_point = shift;
     my $df = df($mount_point, 1) or die "could not df ${mount_point}\n";
     my $bytes_avail = $df->{'bavail'} or die "could not get available bytes for ${mount_point}\n";
-    my $gib_avail = bytes_to_gib($bytes_avail);
-    print "filesystem mounted at ${mount_point} has $gib_avail GiB available\n" if($DEBUG>0);
-    return $gib_avail;
+    print "filesystem mounted at ${mount_point} has $bytes_avail Bytes available\n" if($DEBUG>0);
+    return $bytes_avail;
 }
 
 sub lustre_get_available_quota {
@@ -100,7 +101,7 @@ sub lustre_get_available_quota {
 
     my $group_remaining = lustre_get_group_size_remaining($mount_point, $group);
     my $user_remaining = lustre_get_user_size_remaining($mount_point, $username);
-    my $disk_avail = lustre_get_size_available($mount_point);
+    my $disk_avail = df_get_size_available($mount_point);
 
     my $available_quota = $disk_avail; 
 
@@ -127,14 +128,17 @@ sub lustre_get_available_quota {
 sub size_formatted_to_bytes {
     my $formatted = shift;
     
-    $formatted =~ m/^([0-9]+([.][0-9]+)?)[[:space:]]*((B|KiB|MiB|GiB|TiB|PiB|EiB|ZiB|YiB|kB|MB|GB|TB|PB|EB|ZB|YB){0,1})$/ or error_exit("convert_to_bytes: malformatted string [$formatted]");
+    $formatted =~ m/^([0-9]+([.][0-9]+)?)[[:space:]]*((B|K|M|G|T|P|E|Z|Y|KB|MB|GB|TB|PB|EB|ZB|YB){0,1})$/ or die("size_formatted_to_bytes: malformatted string [$formatted]");
     
     my $value = $1;
     my $units = $3 || "B";
     
     # fixed unit specification requiring conversion
-    for (my $i=0; $i<@{$DECIMAL_UNIT_LABELS}; $i++) {
-        if ($DECIMAL_UNIT_LABELS->[$i] eq $units) {
+    for (my $i=0; $i<@{$DECIMAL_UNIT_LABELS_DF}; $i++) {
+        if ($DECIMAL_UNIT_LABELS_DF->[$i] eq $units) {
+            return sprintf("%d", ($value * 1024 * (1000 ** ($i-1))));
+        }
+        if ($DECIMAL_UNIT_LABELS_QUOTA->[$i] eq $units) {
             return sprintf("%d", ($value * 1024 * (1000 ** ($i-1))));
         }
     }
@@ -160,23 +164,121 @@ sub humgen_nfs_get_remaining {
 		my $limit_bytes = size_formatted_to_bytes($limit);
 		my $used_bytes = size_formatted_to_bytes($used);
 		my $remaining_bytes = $limit_bytes - $used_bytes;
-		return bytes_to_gib($remaining_bytes);
+		return $remaining_bytes;
 	    }
 	}
     }
 }
 
+sub get_user_quota {
+    my $mount_point = shift;
+    my $username = shift;
 
-my $available_quota_gib = 0;
-if ($mount_point =~ m/^\/lustre\/scratch[[:digit:]]+$/) {
-    print STDERR "Have a Lustre filesystem mounted at $mount_point\n" if($DEBUG>0);
-    $available_quota_gib = lustre_get_available_quota($mount_point, $username, $group); 
-} elsif ($mount_point =~ m/^\/nfs\/humgen/) {
-    print STDERR "Have a humgen NFS filesystem mounted at $mount_point\n" if($DEBUG>0);
-    $available_quota_gib = humgen_nfs_get_remaining($mount_point, $group);
-} else {
-    die "Mount point $mount_point is not a supported device.\n";
+    my $quota_remaining_bytes = undef;
+    my $quota_out = `quota -s -f ${mount_point}`;
+    if ($quota_out =~ m/quotas for user ${username}/gsm) {
+	my $suffixcharclass = join('', @{$DECIMAL_UNIT_LABELS_QUOTA});
+	if ($quota_out =~ m/^(\S+)\s+([[:digit:]]+[${suffixcharclass}]?)[*]?\s+([[:digit:]]+[${suffixcharclass}]?)\s+([[:digit:]]+[${suffixcharclass}]?)\s+/gsm) {
+	    my $fs = $1;
+	    my $used_bytes = size_formatted_to_bytes($2);
+	    my $quota_bytes = size_formatted_to_bytes($3);
+	    my $limit_bytes = size_formatted_to_bytes($4);
+	    print STDERR "User $username used $used_bytes of $quota_bytes on ${mount_point} (fs $fs)\n" if($DEBUG>0);
+	    $quota_remaining_bytes = $quota_bytes - $used_bytes;
+	    if ($quota_remaining_bytes < 0) {
+		print STDERR "Over quota, remaining bytes is 0\n" if($DEBUG>0);
+		$quota_remaining_bytes = 0;
+	    }
+	} else {
+	    print STDERR "Could not parse output from `quota` for user ${username} on ${mount_point}: $quota_out\n" if($DEBUG>0);
+	}
+    }
+    
+    my $size_available = df_get_size_available($mount_point);
+    if (defined($quota_remaining_bytes) &&
+	$quota_remaining_bytes < $size_available) {
+	print STDERR "Using quota of $quota_remaining_bytes for user $user on mount point ${mount_point}\n" if($DEBUG>0);
+	$size_available = $quota_remaining_bytes;
+    } else {
+	print STDERR "Using disk size of $size_available for mount point ${mount_point}\n" if($DEBUG>0);
+    }
+    return $size_available;
 }
 
-print "available quota for ${username}:${group} on ${mount_point} is ${available_quota_gib} GiB\n";
+#################################################################################
+# convert_from_bytes_human - convert bytes to human-readable units
+#
+# Inputs
+#    1: bytes
+#    2: "1" for decimal units ("kB","MB",etc), "0" for binary units ("KiB","MiB",etc)
+# Returns
+#    formatted string including units
+#################################################################################
+sub convert_from_bytes_human {
+    my $bytes = shift;
+    my $decimal = shift;
 
+    my $base = 1024;
+    my @labels = @{$BINARY_UNIT_LABELS};
+    if($decimal) {
+        $base = 1000;
+        @labels = @{$DECIMAL_UNIT_LABELS};
+    }
+
+    my $unit_index = 0;
+  TESTUNIT: while($unit_index < $#labels) { # only need to test n-1 as we'll stay in the final unit
+      my $unitmax = ($base ** ($unit_index+1)) * $HUMAN_TRIGGER_RATIO;
+      if ($bytes < $unitmax) {
+            # we fit in this one, stop here
+	  last TESTUNIT;
+      }
+      $unit_index++;
+  }
+
+    return sprintf("%.1f%s%s", $bytes / ($base ** $unit_index), $OUTPUT_UNIT_SEP, $labels[$unit_index]);
+}
+
+
+
+my $human = 0;
+my $si = 0;
+GetOptions('human|h' => \$human,
+	   'si|s' => \$si,
+    ) or die "Error in command line arguments!\n";
+
+my $dir = shift @ARGV || ".";
+
+print STDERR "human: $human si: $si dir: $dir\n" if($DEBUG>0);
+
+my $st = stat($dir) or die "No such directory $dir: $!\n";
+my ($group, undef) = getgrgid($st->gid);
+print STDERR "Have group ${group}\n" if($DEBUG>0);
+
+my $username = getpwuid($<) or die "Could not ascertain username for uid $<!";
+print STDERR "Have username ${username}\n" if($DEBUG>0);
+
+my $mount_point = path_to_mount_point($dir) or die "Could not determine mount point for $dir: $Sys::Filesystem::MountPoint::errstr\n";
+print STDERR "Have mount point ${mount_point}\n" if($DEBUG>0);
+
+
+my $available_quota = 0;
+if ($mount_point =~ m/^\/lustre\/scratch[[:digit:]]+$/) {
+    print STDERR "Have a Lustre filesystem mounted at $mount_point\n" if($DEBUG>0);
+    $available_quota = lustre_get_available_quota($mount_point, $username, $group); 
+} elsif ($mount_point =~ m/^\/nfs\/humgen/) {
+    print STDERR "Have a humgen NFS filesystem mounted at $mount_point\n" if($DEBUG>0);
+    $available_quota = humgen_nfs_get_remaining($mount_point, $group);
+} else {
+    # try to use quota command on it
+    print STDERR "Have a generic filesystem mounted at $mount_point\n" if($DEBUG>0);
+    $available_quota = get_user_quota($mount_point, $username);
+    if ($available_quota < 0) {
+	die "Mount point $mount_point is not a supported device.\n";
+    }
+}
+
+if($human > 0) {
+    $available_quota = convert_from_bytes_human($available_quota, $si);
+}
+
+print "${available_quota} ${mount_point} (for ${username}:${group})\n"
