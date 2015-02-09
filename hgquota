@@ -281,4 +281,4 @@ if($human > 0) {
     $available_quota = convert_from_bytes_human($available_quota, $si);
 }
 
-print "${available_quota} ${mount_point} (for ${username}:${group})\n"
+print "${available_quota} ${dir} (for ${username}:${group} on ${mount_point})\n"
