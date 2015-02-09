@@ -1,0 +1,104 @@
+#!/usr/bin/env perl
+
+################################################################################
+# Copyright (c) 2015 Genome Research Ltd. 
+# 
+# Author: Joshua C. Randall <jcrandall@alum.mit.edu>
+# 
+# This program is free software: you can redistribute it and/or modify it under 
+# the terms of the GNU Affero General Public License as published by the Free 
+# Software Foundation; either version 3 of the License, or (at your option) any 
+# later version. 
+# 
+# This program is distributed in the hope that it will be useful, but WITHOUT 
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS 
+# FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more 
+# details. 
+# 
+# You should have received a copy of the GNU Affero General Public License 
+# along with this program. If not, see <http://www.gnu.org/licenses/>. 
+################################################################################
+
+use File::stat qw(stat);
+use Sys::Filesystem::MountPoint qw(path_to_mount_point);
+use Filesys::Df qw(df);
+
+my $LOP_CMD="/software/hgi/pkglocal/lustre_operator-git-602b61d/bin/lustre_operator /usr/bin/lfs";
+my $DEBUG=0;
+
+my $dir = shift || ".";
+
+my $st = stat($dir) or die "No such directory $dir: $!\n";
+my ($group, undef) = getgrgid($st->gid);
+print STDERR "Have group ${group}\n" if($DEBUG>0);
+
+my $username = getpwuid($<) or die "Could not ascertain username for uid $<!";
+print STDERR "Have username ${username}\n" if($DEBUG>0);
+
+my $mount_point = path_to_mount_point($dir) or die "Could not determine mount point for $dir: $Sys::Filesystem::MountPoint::errstr\n";
+print STDERR "Have mount point ${mount_point}\n" if($DEBUG>0);
+
+sub lustre_get_group_size_remaining {
+    my $mount_point = shift;
+    my $group = shift;
+    
+    my $lop_group_output = `${LOP_CMD} ${mount_point} getquota -g ${group} -s GiB -f dumper` or die "Error getting quota for group ${group} on ${mount_point} - are you in group ${group}?\n";
+    my $lop_group = eval ${lop_group_output};
+    if ( exists($lop_group->{group}) &&
+	 exists($lop_group->{group}->{${group}}) ) {
+	my $size_remaining = $lop_group->{group}->{${group}}->{'size-remaining'};
+	$size_remaining =~ s/[[:space:]]*GiB$//;
+	print STDERR "${group} has ${size_remaining} GiB on ${mount_point}\n" if($DEBUG>0);
+	return $size_remaining;
+    } else {
+	die "Could not parse output from lustre_operator: $lop_group_output\n";
+    }
+}
+
+sub lustre_get_user_size_remaining {
+    my $mount_point = shift;
+    my $user = shift;
+    
+    my $lop_user_output = `${LOP_CMD} ${mount_point} getquota -u ${user} -s GiB -f dumper` or die "Error getting quota for user ${user} on ${mount_point}\n";
+    my $lop_user = eval ${lop_user_output};
+    if ( exists($lop_user->{user}) &&
+	 exists($lop_user->{user}->{${user}}) ) {
+	my $size_remaining = $lop_user->{user}->{${user}}->{'size-remaining'};
+	$size_remaining =~ s/[[:space:]]*GiB$//;
+	print STDERR "${user} has ${size_remaining} GiB on ${mount_point}\n" if($DEBUG>0);
+	return $size_remaining;
+    } else {
+	die "Could not parse output from lustre_operator: $lop_user_output\n";
+    }
+}
+
+sub lustre_get_size_available {
+    my $mount_point = shift;
+    my $df = df($mount_point) or die "could not df ${mount_point}\n";
+    my $bytes_avail = $df->{'bavail'} or die "could not get available bytes for ${mount_point}\n";
+    my $gib_avail = $bytes_avail / (1024 ** 3);
+    print "filesystem mounted at ${mount_point} has $gib_avail GiB available\n" if($DEBUG>0);
+    return $gib_avail;
+}
+
+if ($mount_point =~ m/^\/lustre\/scratch[[:digit:]]+$/) {
+
+    print STDERR "$dir is owned by group $group and is on Lustre device mounted at $mount_point\n" if($DEBUG>0);
+
+    my $group_remaining = lustre_get_group_size_remaining($mount_point, $group);
+    my $user_remaining = lustre_get_user_size_remaining($mount_point, $username);
+    my $disk_avail = lustre_get_size_available($mount_point);
+    my $effective_quota = $disk_avail; 
+    if (! $group_remaining =~ m/unlimited/) {
+	$effective_quota = $group_remaining;
+    }
+    if (! $user_remaining =~ m/unlimited/) {
+	if ($user_remaining < $effective_quota) {
+	    $effective_quota = $user_remaining;
+	}
+    }
+    
+    print "available quota for ${username}:${group} on ${mount_point} is ${effective_quota} GiB\n";
+} else {
+    die "Mount point $mount_point does not look like a Lustre device.\n";
+}
